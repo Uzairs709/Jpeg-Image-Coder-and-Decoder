@@ -23,6 +23,41 @@ QUANTIZATION_MATRIX_LUMA = np.array([
     [72, 92, 95, 98, 112, 100, 103, 99]
 ])
 
+# Standard JPEG Quantization Matrix for Chrominance (Cb, Cr)
+QUANTIZATION_MATRIX_CHROMA = np.array([
+    [17, 18, 24, 47, 99, 99, 99, 99],
+    [18, 21, 26, 66, 99, 99, 99, 99],
+    [24, 26, 56, 99, 99, 99, 99, 99],
+    [47, 66, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99]
+])
+
+# Add these helper functions to both files
+
+def get_size_category(value):
+    """
+    Returns the bit size category for a value according to JPEG standard (Table K.3).
+    Size 0 for value 0.
+    Size 1 for -1, 1.
+    Size 2 for -3 to -2, 2 to 3.
+    Size 3 for -7 to -4, 4 to 7.
+    ...
+    Size 10 for -1023 to -512, 512 to 1023.
+    """
+    if value == 0:
+        return 0
+    # Calculate size based on the number of bits needed for the absolute value
+    size = 0
+    abs_value = abs(value)
+    # (1 << size) - 1 is equivalent to 2^size - 1
+    # The size category is the smallest size such that abs_value fits in 'size' bits.
+    while abs_value > (1 << size) -1:
+        size += 1
+    return size
+
 
 def rgb_to_ycbcr(img):
     """
@@ -83,41 +118,145 @@ def zigzag_scan(block):
     ]
     return np.array([block[i, j] for i, j in zigzag_index])
 
+def dc_encode_symbol(dc_diff):
+    """Encodes DC difference into (size, amplitude)."""
+    # Amplitude is the actual difference value
+    # Size is the bit category of the difference value
+    return (get_size_category(dc_diff), dc_diff)
 
+
+def ac_encode_symbols(acs):
+    """
+    Encodes AC coefficients using RLE and returns a list of (symbol, amplitude) tuples.
+    Symbols are (Run, Size), special cases EOB ('EOB', None), ZRL ((15, 0), None).
+    """
+    symbols = []
+    zero_run = 0
+    # Iterate through the 63 AC coefficients (indices 1 to 63 after zig-zag)
+    for i in range(63):
+        coeff = acs[i] # Get the current AC coefficient
+
+        if coeff == 0:
+            zero_run += 1
+        else:
+            # Handle runs of zeros longer than 15 by inserting ZRLs
+            while zero_run > 15:
+                symbols.append(((15, 0), None)) # ZRL symbol for 16 zeros
+                zero_run -= 16
+
+            # Encode the non-zero AC coefficient
+            size = get_size_category(coeff)
+            # The symbol is a tuple (Run of Zeros before this coeff, Size Category of coeff)
+            symbol = (zero_run, size)
+            amplitude = coeff # The amplitude is the actual value
+            symbols.append((symbol, amplitude))
+
+            zero_run = 0 # Reset zero run after a non-zero coefficient
+
+    # After iterating through all 63 ACs, if there are trailing zeros, add EOB
+    # EOB indicates the rest of the block (from the current position) are zeros.
+    # We add EOB if the last AC wasn't processed (i.e., trailing zeros existed)
+    # or if the block was entirely zeros (zero_run == 63).
+    # A simple check is if the total number of encoded symbols + zero_run + 1 (for DC)
+    # doesn't cover all 64 positions. A simpler approach: if zero_run > 0 after loop, add EOB.
+    # Also if the list of symbols is empty (meaning all 63 ACs were zero), we need EOB.
+    if zero_run > 0 or len(symbols) == 0:
+         symbols.append(('EOB', None))
+
+    return symbols
+
+
+# Update the encode_image function to use these helpers
 def encode_image(img):
     """
-    Full encoding pipeline:
+    Full encoding pipeline producing symbol/amplitude lists:
     - Convert to YCbCr
     - Split into blocks
     - Apply DCT
     - Quantize
     - Zig-zag scan
-    - Return encoded list
+    - Perform DC differential and AC RLE encoding
+    - Return list of channel data with symbol/amplitude lists
     """
     # If color image, convert
-    if len(img.shape) == 3:
+    if len(img.shape) == 3 and img.shape[2] == 3:
         img = rgb_to_ycbcr(img)
+        channels = 3
+    elif len(img.shape) == 2: # Grayscale
+        channels = 1
+    else:
+         raise ValueError("Input image must be grayscale or 3-channel color")
+
 
     h, w = img.shape[:2]
-    channels = img.shape[2] if len(img.shape) == 3 else 1
+
 
     encoded_channels = []
 
-    for ch in range(channels):
-        channel = img[:, :, ch] if channels > 1 else img
+    # Store last_dc value for differential encoding, initialized to 0 for each channel
+    last_dc = [0] * channels
+
+
+    for ch_index in range(channels):
+        # Extract channel data - ensure it's 2D for block_split
+        if channels > 1:
+            channel_data_2d = img[:, :, ch_index]
+            # Determine channel type for decoder
+            if ch_index == 0:
+                channel_type = 'Y'
+            elif ch_index == 1:
+                channel_type = 'Cb'
+            else: # ch_index == 2
+                channel_type = 'Cr'
+        else: # Grayscale
+            channel_data_2d = img[:, :]
+            channel_type = 'Y' # Grayscale channel is treated as Luminance
 
         # Level shift by -128
-        channel = channel - 128
+        channel_shifted = channel_data_2d.astype(np.float32) - 128 # Use float for intermediate steps
 
-        blocks = block_split(channel)
-        encoded_blocks = []
+        blocks = block_split(channel_shifted)
+        encoded_blocks_symbols_list = [] # List to hold symbol/amplitude lists for each block
+
+
+        # Select quantization matrix based on channel type
+        # In JPEG, Cb and Cr use the same chrominance matrix
+        if channel_type in ('Cb', 'Cr'):
+            quant_matrix = QUANTIZATION_MATRIX_CHROMA
+        else: # 'Y' (Luminance)
+            quant_matrix = QUANTIZATION_MATRIX_LUMA
+
 
         for block in blocks:
             dct_block = dct_2d(block)
-            quant_block = quantize(dct_block)
+            quant_block = quantize(dct_block, quant_matrix=quant_matrix)
+
+            # Zig-zag scan to get the 1D array of 64 coefficients
             zigzag_block = zigzag_scan(quant_block)
-            encoded_blocks.append(zigzag_block)
 
-        encoded_channels.append((h, w, encoded_blocks))
+            # --- Perform DC differential encoding ---
+            current_dc = zigzag_block[0]
+            dc_diff = current_dc - last_dc[ch_index]
+            dc_symbol, dc_amplitude = dc_encode_symbol(dc_diff)
+            last_dc[ch_index] = current_dc # Update last_dc for this channel
 
+            # --- Perform AC RLE encoding ---
+            # Get the 63 AC coefficients (elements 1 to 63 from the zig-zag scan)
+            ac_coeffs = zigzag_block[1:]
+            ac_symbols_and_amplitudes = ac_encode_symbols(ac_coeffs)
+
+            # Combine DC and AC symbols/amplitudes for this block
+            # The block symbols list starts with DC, followed by ACs including EOB/ZRL
+            block_symbols = [(dc_symbol, dc_amplitude)] + ac_symbols_and_amplitudes
+
+            encoded_blocks_symbols_list.append(block_symbols)
+
+
+        # The encoded data for a channel is now a tuple:
+        # (original_height, original_width, channel_type, list_of_block_symbols_lists)
+        # We need original height and width for merging blocks correctly later
+        encoded_channels.append((h, w, channel_type, encoded_blocks_symbols_list))
+
+    # The return value is a list containing data for each channel
+    # Example: [(h_y, w_y, 'Y', [block_symbols_y1, ...]), (h_cb, w_cb, 'Cb', [block_symbols_cb1, ...]), ...]
     return encoded_channels
