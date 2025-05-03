@@ -1,19 +1,7 @@
-"""
-decoder.py
-This file contains functions for JPEG decompression, including Huffman decoding:
-- Reads Huffman-encoded bitstream
-- Decodes Huffman codes and amplitude bits to get symbols and coefficients
-- Inverse zig-zag scan
-- Dequantization
-- Inverse DCT
-- Block merging
-- Convert YCbCr back to RGB
-"""
-
 import numpy as np
 from scipy.fftpack import dct, idct
+import logging
 
-# Standard JPEG Quantization Matrix for Luminance (Y)
 QUANTIZATION_MATRIX_LUMA = np.array([
     [16, 11, 10, 16, 24,  40,  51,  61],
     [12, 12, 14, 19, 26,  58,  60,  55],
@@ -25,7 +13,6 @@ QUANTIZATION_MATRIX_LUMA = np.array([
     [72, 92, 95, 98,112, 100, 103,  99]
 ])
 
-# Standard JPEG Quantization Matrix for Chrominance (Cb, Cr)
 QUANTIZATION_MATRIX_CHROMA = np.array([
     [17, 18, 24, 47, 99, 99, 99, 99],
     [18, 21, 26, 66, 99, 99, 99, 99],
@@ -38,13 +25,11 @@ QUANTIZATION_MATRIX_CHROMA = np.array([
 ])
 
 
-# --- Helper functions for Size Category and Amplitude encoding/decoding ---
+logging.basicConfig(level=logging.INFO)
 
+
+# --- Helper functions for Size Category and Amplitude encoding/decoding ---
 def get_size_category(value):
-    """
-    Returns the bit size category for a value according to JPEG standard (Table K.3).
-    Size 0 for value 0. Size 1 for -1, 1, etc.
-    """
     if value == 0:
         return 0
     size = 0
@@ -52,42 +37,36 @@ def get_size_category(value):
     while abs_value > (1 << size) -1:
         size += 1
         if size > 11: # Max DC size is 11, max AC size is 10. Should not exceed this.
-             print(f"Warning: Calculated size category {size} for value {value}. Capping at 11.")
+             logging.warning(f"Calculated size category {size} for value {value}. Capping at 11.")
              size = 11
              break
     return size
 
 
 def decode_amplitude(size, amplitude_bits):
-    """
-    Decodes the amplitude bits back to the signed integer value
-    based on its size category (Ref. JPEG standard, Table K.3, K.5).
-    """
     if size == 0:
-        return 0 # Should not happen for non-zero size
-    # If the most significant bit of the amplitude_bits is 1, it's a negative number
-    # The check is (amplitude_bits >> (size - 1)) & 1
-    if (amplitude_bits >> (size - 1)) & 1:
-        # Convert from amplitude bits representation to signed value
-        return amplitude_bits - (1 << size)
-    else:
-        # Positive number: amplitude bits are the direct value
+        return 0 
+
+    threshold = 1 << (size - 1)
+
+    if amplitude_bits >= threshold:
         return amplitude_bits
+    else:
+        return amplitude_bits - (1 << size) + 1
 
 
 # --- Function to build Huffman tables from standard lengths and values ---
-
 def build_huffman_table(bits, values, table_type):
-    """
-    Builds a Huffman code table mapping symbol -> (code_length, code_value).
-    :param bits: List with counts of codes of length 1 to 16 (index 1-16).
-    :param values: List of symbols' byte representations (AC) or integer size categories (DC), ordered by code length.
-    :param table_type: String, either 'dc' or 'ac', to correctly interpret values.
-    :return: Dictionary mapping symbol (integer for DC, tuple (Run, Size) for AC) -> (code_length, code_value).
-    """
     huffman_table = {}
     code = 0
     value_pos = 0
+    symbols_added_count = 0 
+
+    expected_symbols_count = sum(bits[1:17])
+
+    assert len(values) == expected_symbols_count, \
+        f"Error building {table_type} Huffman table: 'values' list has unexpected length. Expected {expected_symbols_count}, but got {len(values)}. Check list content."
+
 
     for bit_length in range(1, 17):
         if bit_length < len(bits):
@@ -97,69 +76,62 @@ def build_huffman_table(bits, values, table_type):
 
         for i in range(num_codes_of_length):
             if value_pos >= len(values):
-                 print(f"DEBUG: Error condition met in build_huffman_table.")
-                 print(f"DEBUG: Current bit_length: {bit_length}, code_index: {i}")
-                 print(f"DEBUG: Current value_pos: {value_pos}")
-                 print(f"DEBUG: Length of values list: {len(values)}")
-                 sum_nrcodes_so_far = sum(bits[l] for l in range(1, bit_length)) + i
-                 print(f"DEBUG: Sum of nrcodes processed up to this point: {sum_nrcodes_so_far}")
+                 logging.error(f"Index out of range in build_huffman_table for {table_type} table.")
+                 logging.error(f"bit_length: {bit_length}, code_index: {i}, value_pos: {value_pos}, len(values): {len(values)}")
                  raise IndexError(f"list index out of range in build_huffman_table: value_pos {value_pos} >= len(values) {len(values)} at bit_length {bit_length}, code_index {i}")
 
 
             raw_symbol_value = values[value_pos]
 
             if table_type == 'dc':
-                symbol = raw_symbol_value
+                symbol = int(raw_symbol_value)
                 if not (0 <= symbol <= 11):
-                     print(f"Warning: Unexpected raw DC symbol value {raw_symbol_value} encountered.")
+                     logging.warning(f"Unexpected raw DC symbol value {raw_symbol_value} encountered.")
 
             elif table_type == 'ac':
                  raw_val_int = int(raw_symbol_value)
                  if raw_val_int == 0x00:
-                     symbol = (0, 0) # EOB symbol
+                     symbol = (0, 0)
                  elif raw_val_int == 0xF0:
-                      symbol = (15, 0) # ZRL symbol
-                 elif 0x01 <= raw_val_int <= 0xEF:
-                      run = (raw_val_int >> 4) & 0x0F
-                      size = raw_val_int & 0x0F
+                      symbol = (15, 0)
+                 elif raw_val_int != 0x00 and raw_val_int != 0xF0:
+                      run = (raw_val_int >> 4) & 0x0F 
+                      size = raw_val_int & 0x0F 
                       symbol = (run, size)
                  else:
-                      print(f"Warning: Unexpected raw AC symbol value {raw_symbol_value} ({raw_val_int}) encountered.")
-                      value_pos += 1 # Increment value_pos even if skipping
-                      continue # Skip this value
+                      logging.warning(f"Truly unexpected raw AC symbol value {raw_symbol_value} ({raw_val_int}) encountered in {table_type} values list. Skipping.")
+                      value_pos += 1 
+                      continue
+
 
             else:
                  raise ValueError(f"Unknown table_type: {table_type}")
 
             if isinstance(symbol, (int, tuple)):
                  huffman_table[symbol] = (bit_length, code)
+                 symbols_added_count += 1 
             else:
-                 print(f"Warning: Skipping unhashable symbol type {type(symbol)}: {symbol}")
+                 logging.warning(f"Skipping unhashable symbol type {type(symbol)}: {symbol}")
 
             code += 1
             value_pos += 1
 
         code <<= 1
 
-    if table_type == 'ac':
-        print(f"DEBUG: Finished building {table_type} table. Total symbols added: {len(huffman_table)}")
-        if (15, 1) in huffman_table:
-             print(f"DEBUG: Symbol (15, 1) FOUND in {table_type} table. Code: {huffman_table[(15, 1)]}")
-        else:
-             print(f"DEBUG: Symbol (15, 1) NOT FOUND in {table_type} table.")
-             # print(f"DEBUG: All keys in {table_type} table: {list(huffman_table.keys())}")
+    assert symbols_added_count == expected_symbols_count, \
+        f"Error building {table_type} Huffman table: Expected {expected_symbols_count} symbols, but added {symbols_added_count}. This indicates an issue processing the 'values' list content."
+
+
+    logging.info(f"Finished building {table_type} table. Total symbols added: {len(huffman_table)}")
 
 
     return huffman_table
 
-# --- Standard JPEG Huffman Table Data (as defined in the spec) ---
+# --- Standard JPEG Huffman Table Data (as defined in the spec) 
+std_dc_luminance_nrcodes = [0, 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+std_dc_luminance_values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
-# DC Luminance: counts of codes per length, followed by symbols (0-11)
-std_dc_luminance_nrcodes = [0, 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0] # Index 0 unused, lengths 1-16
-std_dc_luminance_values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] # Total 12
-
-# AC Luminance: counts of codes per length, followed by symbols (byte representation)
-std_ac_luminance_nrcodes = [0,0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,0x7d] # Last element 0x7d (125) is count for length 16
+std_ac_luminance_nrcodes = [0,0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,0x7d] 
 std_ac_luminance_values = [
     0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
     0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
@@ -181,16 +153,13 @@ std_ac_luminance_values = [
     0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
     0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea,
     0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
-    0xf9, 0xfa,
-    0x10, 0x20 # Total 162 elements
+    0xf9, 0xfa
 ]
 
-# DC Chrominance: counts of codes per length, followed by symbols (0-11)
-std_dc_chrominance_nrcodes = [0, 0, 3, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0] # Index 0 unused, lengths 1-16
-std_dc_chrominance_values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] # Total 12
+std_dc_chrominance_nrcodes = [0, 0, 3, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+std_dc_chrominance_values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
-# AC Chrominance: counts of codes per length, followed by symbols (byte representation)
-std_ac_chrominance_nrcodes = [0,0,2,1,2,4,4,3,4,7,5,4,4,0,1,2,0x77] # Last element 0x77 (119) is count for length 16
+std_ac_chrominance_nrcodes = [0,0,2,1,2,4,4,3,4,7,5,4,4,0,1,2,0x77]
 std_ac_chrominance_values = [
     0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21,
     0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
@@ -212,25 +181,16 @@ std_ac_chrominance_values = [
     0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
     0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9,
     0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
-    0xf9, 0xfa,
-    0x10, 0x20
-] # Total 162 elements
+    0xf9, 0xfa
+]
 
-
-# Add temporary print statements to verify list lengths *after* definition
-print(f"Length of std_dc_luminance_values: {len(std_dc_luminance_values)}")
-print(f"Length of std_ac_luminance_values: {len(std_ac_luminance_values)}")
-print(f"Length of std_dc_chrominance_values: {len(std_dc_chrominance_values)}")
-print(f"Length of std_ac_chrominance_values: {len(std_ac_chrominance_values)}")
-
-
-# === BUILD THE FINAL HUFFMAN TABLES (map symbol -> (length, code)) ===
-
-# Pass the table type ('dc' or 'ac') to the build function
+# Build tables
 HUFF_TABLE_LUMA_DC = build_huffman_table(std_dc_luminance_nrcodes, std_dc_luminance_values, 'dc')
 HUFF_TABLE_LUMA_AC = build_huffman_table(std_ac_luminance_nrcodes, std_ac_luminance_values, 'ac')
 HUFF_TABLE_CHROMA_DC = build_huffman_table(std_dc_chrominance_nrcodes, std_dc_chrominance_values, 'dc')
 HUFF_TABLE_CHROMA_AC = build_huffman_table(std_ac_chrominance_nrcodes, std_ac_chrominance_values, 'ac')
+
+print(f"Lengths: DC_Y={len(std_dc_luminance_values)}, AC_Y={len(std_ac_luminance_values)}, DC_C={len(std_dc_chrominance_values)}, AC_C={len(std_ac_chrominance_values)}")
 
 
 # Helper to get the correct Huffman tables based on channel type
@@ -243,135 +203,97 @@ def get_huffman_tables(channel_type):
         raise ValueError(f"Unknown channel type: {channel_type}")
 
 
-# --- Bitstream Handling Classes ---
-
-# Note: BitStreamWriter is only needed in encoder.py, but BitStreamReader is needed here.
+# --- Bitstream Handling Classes
 class BitStreamReader:
-    """Reads bits from a byte stream, handling byte unstuffing (0xFF -> 0xFF 0x00)."""
     def __init__(self, byte_data):
-        self._byte_data = byte_data # The input byte stream (bytes or bytearray)
-        self._byte_index = 0      # Current index in the byte stream
-        self._bits_in_byte = 0    # Number of bits already read from the current byte (0-7)
-        self._current_byte = 0    # The byte currently being read from (integer 0-255)
+        self._byte_data = byte_data
+        self._byte_index = 0
+        self._bits_in_byte = 0
+        self._current_byte = 0
 
         # Load the first byte to start if data exists
         if len(self._byte_data) > 0:
             self._current_byte = self._byte_data[self._byte_index]
+            logging.info(f"Initialized BitStreamReader. First byte: {self._current_byte:02x} at index {self._byte_index}")
+
 
     def read_bits(self, num_bits):
-        """Reads the specified number of bits from the stream."""
         if num_bits <= 0:
             return 0
 
         result = 0
-        for _ in range(num_bits):
+        # logging.info(f"Attempting to read {num_bits} bits. Current byte index: {self._byte_index}, bits in byte: {self._bits_in_byte}")
+
+        for i in range(num_bits):
             # If all bits in the current byte are read, load the next byte
             if self._bits_in_byte == 8:
                 self._byte_index += 1
-                # Handle JPEG Byte Unstuffing: If the previous byte was 0xFF,
-                # and the current byte is 0x00, skip the 0x00.
-                # Check against length - 1 to avoid index error on the last byte
                 if self._byte_index < len(self._byte_data) and self._byte_data[self._byte_index - 1] == 0xFF and self._byte_data[self._byte_index] == 0x00:
+                     logging.info(f"Byte unstuffing: Skipping byte {self._byte_index} (0x00) after 0xFF at index {self._byte_index - 1}")
                      self._byte_index += 1
 
-                # Check if we ran out of data
+                # Check if we ran out of data after potential unstuffing
                 if self._byte_index >= len(self._byte_data):
-                    # print(f"Warning: Tried to read {num_bits} bits past end of bitstream. Returning -1.")
-                    return -1 # Indicate end of stream/error
+                    logging.warning(f"Ran out of bytes while reading bit {i+1}/{num_bits}. Returning None.")
+                    return None # Indicate end of stream/error
 
                 # Load the next byte
-                if self._byte_index < len(self._byte_data): # Added safety check
-                    self._current_byte = self._byte_data[self._byte_index]
-                    self._bits_in_byte = 0 # Reset bit counter for the new byte
-                else:
-                     # Really out of data
-                     # print("Warning: Ran out of bytes in BitStreamReader")
-                     return -1
+                self._current_byte = self._byte_data[self._byte_index]
+                self._bits_in_byte = 0 # Reset bit counter for the new byte
+                logging.info(f"Loaded new byte: {self._current_byte:02x} at index {self._byte_index}")
 
 
-            # Get the next bit (from MSB to LSB of the current byte)
             bit = (self._current_byte >> (7 - self._bits_in_byte)) & 1
-            result = (result << 1) | bit # Add the bit to the result
-            self._bits_in_byte += 1 # Increment bit counter within the byte
+            result = (result << 1) | bit
+            self._bits_in_byte += 1
 
-        return result # Return the integer value of the bits read
+
+        return result
 
     def has_more_bits(self):
-        """Checks if there are more bits available in the stream."""
-        # More bits available if there are more bytes to read OR if the current byte
-        # is not fully read.
-        return self._byte_index < len(self._byte_data) or (self._byte_index == len(self._byte_data) - 1 and self._bits_in_byte < 8)
+        bits_remaining = len(self._byte_data) * 8 - (self._byte_index * 8 + self._bits_in_byte)
+        return self._byte_index < len(self._byte_data)
 
 
-    # Helper for Huffman decoding: read bits and check against codes
-    # A simple way is to read bit by bit and check against all codes of increasing length
     def decode_symbol(self, huff_table):
-        """
-        Reads bits from the stream and decodes the next Huffman symbol.
-        Returns the decoded symbol (integer or tuple) or None if decoding fails.
-        """
         current_value = 0
         current_length = 0
 
-        # Create a reverse lookup: (code_value, code_length) -> symbol
-        # This is inefficient if done every time. Better to build it once per channel.
-        # For now, build it here for clarity.
         reverse_lookup = {}
         for symbol, (length, code) in huff_table.items():
-             # Ensure uniqueness - canonical codes should be unique
              if (code, length) in reverse_lookup:
-                  # This indicates an issue with the Huffman table itself
-                  print(f"Error: Duplicate Huffman code entry for {(code, length)}")
-                  return None # Indicate failure
+                  logging.error(f"Duplicate Huffman code entry for {(code, length)}")
+                  return None
              reverse_lookup[(code, length)] = symbol
 
 
-        # Read up to the maximum possible Huffman code length (16 for AC, 9 for DC symbols 0-11)
-        # Determine max length dynamically from the table passed in
         max_code_length = 0
         if huff_table:
-            # Max length for DC symbols 0-11 is 9. Max length for AC symbols is 16.
-            # We need to know if this is a DC or AC table to set the max length correctly
-            # A simple check: if any symbol is a tuple, it's an AC table.
-            is_ac_table = any(isinstance(s, tuple) for s in huff_table.keys())
-            if is_ac_table:
-                 max_code_length = max(length for symbol, (length, code) in huff_table.items()) # Max AC code length is 16
-            else:
-                 # For DC tables, the max symbol is 11, max code length is 9
-                 max_code_length = max(length for symbol, (length, code) in huff_table.items()) # Max DC code length is 9 (for symbol 11)
-                 # Add a safety cap, standard max is 16
-                 if max_code_length > 16: max_code_length = 16 # Should not happen with standard tables
-
-
+            max_code_length = max(length for symbol, (length, code) in huff_table.items())
+            if max_code_length > 16: max_code_length = 16
         else:
-             # Should not happen if tables are built correctly
-             print("Error: decode_symbol called with empty Huffman table.")
+             logging.error("decode_symbol called with empty Huffman table.")
              return None
 
 
-        for _ in range(max_code_length): # Read up to max_code_length bits
+        for _ in range(max_code_length):
             bit = self.read_bits(1)
-            if bit == -1: # Ran out of data
-                 # print("Error: Ran out of bits while decoding Huffman symbol")
-                 return None # Indicate failure
+            if bit is None: 
+                 return None
 
             current_value = (current_value << 1) | bit
             current_length += 1
 
-            # Check if the current bit sequence matches any code in the reverse lookup
             if (current_value, current_length) in reverse_lookup:
                 symbol = reverse_lookup[(current_value, current_length)]
-                return symbol # Return the decoded symbol
+                return symbol
 
-        # If we read max_code_length bits and didn't find a symbol, something is wrong
-        print(f"Error: Could not decode Huffman symbol after {max_code_length} bits. Current value: {current_value}, length: {current_length}")
-        return None # Indicate failure
+        logging.error(f"Could not decode Huffman symbol after {max_code_length} bits. Current value: {current_value}, length: {current_length}")
+        return None
 
 
-# --- Inverse Transformation and Block Merging (from previous code) ---
-
+# --- Inverse Transformation and Block Merging
 def inverse_zigzag(arr, block_size=8):
-    # ... (this function is correct)
     zigzag_index = [
         (0,0),(0,1),(1,0),(2,0),(1,1),(0,2),(0,3),(1,2),
         (2,1),(3,0),(4,0),(3,1),(2,2),(1,3),(0,4),(0,5),
@@ -390,20 +312,14 @@ def inverse_zigzag(arr, block_size=8):
 
 
 def dequantize(block, quant_matrix=QUANTIZATION_MATRIX_LUMA):
-    # ... (this function is correct)
     return block * quant_matrix
 
 
 def idct_2d(block):
-    """
-    Applies 2D Inverse DCT on an 8x8 block (expects float input).
-    """
-    # IDCT output should be float before level shift
     return idct(idct(block.T, norm='ortho').T, norm='ortho')
 
 
 def block_merge(blocks, image_shape, block_size=8):
-    # ... (this function is correct)
     h, w = image_shape
     num_blocks_w = (w + block_size - 1) // block_size
     num_blocks_h = (h + block_size - 1) // block_size
@@ -411,14 +327,12 @@ def block_merge(blocks, image_shape, block_size=8):
     padded_h = num_blocks_h * block_size
     padded_w = num_blocks_w * block_size
 
-    # Use float32 type for image reconstruction before final clipping/conversion
     img_padded = np.zeros((padded_h, padded_w), dtype=np.float32)
 
     idx = 0
     for i in range(0, padded_h, block_size):
         for j in range(0, padded_w, block_size):
             if idx < len(blocks):
-                 # Ensure block is float32 before assignment if not already
                  img_padded[i:i+block_size, j:j+block_size] = blocks[idx].astype(np.float32)
             idx += 1
 
@@ -428,188 +342,123 @@ def block_merge(blocks, image_shape, block_size=8):
 
 
 def ycbcr_to_rgb(img):
-    """
-    Converts a YCbCr image back to RGB (Assumes float32 input).
-    Handles clipping and returns uint8.
-    """
-    # Ensure input is float32 as expected
     img = img.astype(np.float32)
 
     xform = np.array([[1, 0, 1.402],
                       [1, -0.34414, -0.71414],
                       [1, 1.772, 0]])
-    img[:, :, [1, 2]] -= 128 # Subtract 128 from Cb and Cr
-    # Matrix multiplication
+    img[:, :, [1, 2]] -= 128
     rgb = img @ xform.T
-    # Clip to 0-255 range and convert to uint8
     rgb = np.clip(rgb, 0, 255)
     return rgb.astype(np.uint8)
 
 
 def dc_decode_value(last_dc, dc_amplitude):
-    """Decodes DC amplitude back to the DC value (last_dc + amplitude)."""
     return last_dc + dc_amplitude
 
 
-# Remove the old ac_decode_symbols function definition here.
-# The logic to decode AC symbols will be integrated into the decode_image loop.
-
-
 def decode_image(encoded_channels):
-    """
-    Full decoding pipeline from Huffman-encoded bitstream bytes per channel.
-    Reads bitstream, decodes symbols/amplitudes, reconstructs coefficients,
-    then performs inverse zig-zag, dequantization, IDCT, merge, and color conversion.
-    """
     reconstructed = []
 
-    # Store last_dc value for differential decoding, initialized to 0 for each channel
-    # The size of last_dc list depends on the number of channels in the encoded data
     last_dc = [0] * len(encoded_channels)
 
 
-    # Use enumerate to get both the index (ch_index) and the data (channel_data)
     for ch_index, channel_data in enumerate(encoded_channels):
-        # Unpack the new structure: (original_height, original_width, channel_type, bitstream_bytes)
         h, w, channel_type, bitstream_bytes = channel_data
 
-        # Get the correct Huffman tables for this channel
         huff_dc_table, huff_ac_table = get_huffman_tables(channel_type)
 
-        # Initialize a bitstream reader for this channel's byte data
         bitstream_reader = BitStreamReader(bitstream_bytes)
 
-        blocks = [] # List to hold reconstructed 8x8 blocks (after IDCT, before merge)
+        blocks = []
 
-        # Select dequantization matrix based on channel type
         if channel_type in ('Cb', 'Cr'):
             quant_matrix = QUANTIZATION_MATRIX_CHROMA
-        else: # 'Y' or grayscale
+        else:
             quant_matrix = QUANTIZATION_MATRIX_LUMA
 
-
-        # --- Decode Blocks from Bitstream ---
-        # Loop and decode blocks as long as there's data in the bitstream.
-        # A real decoder checks block count or uses restart markers.
-        # Here, we just read until EOB doesn't leave enough bits for the next DC or we finish all blocks.
         block_size = 8
         num_blocks_h = (h + block_size - 1) // block_size
         num_blocks_w = (w + block_size - 1) // block_size
         expected_num_blocks = num_blocks_h * num_blocks_w
         blocks_decoded_count = 0
 
+        logging.info(f"Starting decoding for {channel_type} channel. Expected blocks: {expected_num_blocks}")
 
-        while blocks_decoded_count < expected_num_blocks and bitstream_reader.has_more_bits():
-            # Start of a new block
-            # print(f"DEBUG: Decoding block {blocks_decoded_count} for {channel_type} channel.")
-            # print(f"DEBUG: Bitstream position before DC: Byte {bitstream_reader._byte_index}, Bit {bitstream_reader._bits_in_byte}")
-
+        while blocks_decoded_count < expected_num_blocks: 
 
             # --- Decode DC ---
-            # Read bits and decode the DC symbol (size category)
-            dc_symbol = bitstream_reader.decode_symbol(huff_dc_table) # This table now has integer keys
-            if dc_symbol is None: # Error decoding symbol or ran out of bits unexpectedly
-                 print(f"Error decoding DC symbol for block {blocks_decoded_count} in {channel_type} channel. Likely corrupted data or unexpected end of stream.")
+            dc_symbol = bitstream_reader.decode_symbol(huff_dc_table)
+            if dc_symbol is None:
+                 logging.error(f"Failed to decode DC symbol for block {blocks_decoded_count} in {channel_type} channel. Likely corrupted data or unexpected end of stream.")
                  break # Stop decoding this channel
 
-            # print(f"DEBUG: Decoded DC symbol: {dc_symbol}")
 
-            # If size > 0, read the DC amplitude bits
             dc_amplitude_bits = 0
             if dc_symbol > 0:
-                dc_amplitude_bits = bitstream_reader.read_bits(dc_symbol) # Size is the number of bits for amplitude
-                if dc_amplitude_bits == -1: # Error reading bits or ran out
-                     print(f"Error reading DC amplitude bits (size {dc_symbol}) for block {blocks_decoded_count} in {channel_type} channel.")
-                     break # Stop decoding this channel
-                # print(f"DEBUG: Decoded DC amplitude bits: {dc_amplitude_bits} (size {dc_symbol})")
+                dc_amplitude_bits = bitstream_reader.read_bits(dc_symbol)
+                if dc_amplitude_bits is None: # Check for None
+                     logging.error(f"Failed to read DC amplitude bits (size {dc_symbol}) for block {blocks_decoded_count} in {channel_type} channel. Stopping decoding for this channel.")
+                     break
 
-
-            # Decode the amplitude bits back to the signed difference value
             dc_amplitude = decode_amplitude(dc_symbol, dc_amplitude_bits)
 
-            # Calculate the current DC value using the differential value
             current_dc = last_dc[ch_index] + dc_amplitude
-            last_dc[ch_index] = current_dc # Update last_dc for this channel
-
-            # print(f"DEBUG: Decoded DC value: {current_dc}")
-
-
-            # --- Decode ACs ---
-            # Initialize a 64-element array for zig-zag coefficients for this block
-            # DC is at index 0, ACs are at indices 1-63
+            last_dc[ch_index] = current_dc
             zigzag_coeffs = np.zeros(64, dtype=np.int32)
             zigzag_coeffs[0] = current_dc # Place the decoded DC value
 
-            ac_idx_in_block = 1 # Start filling AC coefficients from index 1 in zig-zag order (after DC)
+            ac_idx_in_block = 1
 
-            # Loop to decode AC symbols until EOB is decoded or all 63 AC positions are filled
-            while ac_idx_in_block < 64: # Loop until the 64th position is potentially filled
-                # Decode the next AC symbol (Run, Size), EOB, or ZRL
-                ac_symbol = bitstream_reader.decode_symbol(huff_ac_table) # This table has tuple keys
-                if ac_symbol is None: # Error decoding symbol or ran out unexpectedly
-                     print(f"Error decoding AC symbol for block {blocks_decoded_count}, AC index {ac_idx_in_block -1} in {channel_type} channel. Likely corrupted data or unexpected end of stream.")
-                     ac_idx_in_block = 64 # Exit inner loop gracefully
-                     break # Exit outer block decoding loop
+            while ac_idx_in_block < 64:
+                ac_symbol = bitstream_reader.decode_symbol(huff_ac_table)
+                if ac_symbol is None:
+                     logging.error(f"Failed to decode AC symbol for block {blocks_decoded_count}, AC index {ac_idx_in_block -1} in {channel_type} channel. Likely corrupted data or unexpected end of stream.")
+                     ac_idx_in_block = 64
+                     break 
 
-                # print(f"DEBUG: Decoded AC symbol: {ac_symbol}")
 
-                # Handle EOB symbol (0, 0)
                 if ac_symbol == (0, 0):
-                    # Remaining coefficients from ac_idx_in_block onwards are zeros
-                    # (our zigzag_coeffs array is initialized to zeros).
-                    # We just need to advance ac_idx_in_block to 64 to exit the loop.
-                    ac_idx_in_block = 64 # Exit AC decoding loop for this block
-                    break # Exit inner AC decoding loop for this block
+                    ac_idx_in_block = 64
+                    break
 
-                # Handle ZRL (16 zeros) symbol (15, 0)
                 if ac_symbol == (15, 0):
-                    run = 16 # ZRL means 16 zeros
-                    ac_idx_in_block += run # Skip 16 positions
-                    # Check for overflow (should not go past 64, including DC)
+                    run = 16
+                    ac_idx_in_block += run
                     if ac_idx_in_block > 64:
-                         print(f"Warning: ZRL decoding overflow at block {blocks_decoded_count}, AC index {ac_idx_in_block - run} in {channel_type} channel. Index reached {ac_idx_in_block}.")
-                         ac_idx_in_block = 64 # Cap index
-                         break # Exit inner AC decoding loop for this block
-                    continue # Go to decode the next symbol (which comes after the 16 zeros)
+                         logging.warning(f"ZRL decoding overflow at block {blocks_decoded_count}, AC index {ac_idx_in_block - run} in {channel_type} channel. Index reached {ac_idx_in_block}.")
+                         ac_idx_in_block = 64
+                         break
+                    continue
 
-                # Handle regular AC symbol (Run, Size)
                 run, size = ac_symbol
-                ac_idx_in_block += run # Skip 'run' number of zeros
+                ac_idx_in_block += run
 
-                # Check for index overflow before placing the non-zero coefficient
                 if ac_idx_in_block >= 64:
-                     print(f"Warning: AC run overflow at block {blocks_decoded_count}, AC index {ac_idx_in_block - run} in {channel_type} channel. Index reached {ac_idx_in_block}.")
-                     ac_idx_in_block = 64 # Cap index
-                     break # Exit inner AC decoding loop for this block
+                     logging.warning(f"AC run overflow at block {blocks_decoded_count}, AC index {ac_idx_in_block - run} in {channel_type} channel. Index reached {ac_idx_in_block}.")
+                     ac_idx_in_block = 64
+                     break
 
 
-                # Read the AC amplitude bits (only if size > 0)
                 ac_amplitude_bits = 0
                 if size > 0:
                      ac_amplitude_bits = bitstream_reader.read_bits(size)
-                     if ac_amplitude_bits == -1: # Error reading bits or ran out
-                          print(f"Error reading AC amplitude bits (size {size}) for block {blocks_decoded_count}, AC index {ac_idx_in_block-1} in {channel_type} channel.")
-                          ac_idx_in_block = 64 # Exit inner loop
-                          break # Exit outer block decoding loop
-                     # print(f"DEBUG: Decoded AC amplitude bits: {ac_amplitude_bits} (size {size})")
+                     if ac_amplitude_bits is None: # Check for None
+                          logging.error(f"Failed to read AC amplitude bits (size {size}) for block {blocks_decoded_count}, AC index {ac_idx_in_block-1} in {channel_type} channel. Stopping decoding for this channel.")
+                          ac_idx_in_block = 64
+                          break 
 
-
-                # Decode the amplitude bits back to the signed value
                 ac_amplitude = decode_amplitude(size, ac_amplitude_bits)
 
-                # Place the decoded non-zero amplitude value at the current index
                 zigzag_coeffs[ac_idx_in_block] = ac_amplitude
 
-                # print(f"DEBUG: Decoded AC value at index {ac_idx_in_block}: {ac_amplitude}")
+                ac_idx_in_block += 1
 
-                ac_idx_in_block += 1 # Move to the next position for the next symbol/amplitude
+            if ac_idx_in_block < 64 and bitstream_reader.read_bits(1) is None and ac_symbol is None:
+                 break
 
 
-            # After decoding all symbols for the block (either hit EOB or filled 63 ACs),
-            # proceed with inverse transformations for this block.
-
-            # --- Inverse Zig-zag ---
-            # Convert the 1D zig-zag array back to an 8x8 block
+            # --- Inverse Zig-zag
             quant_block = inverse_zigzag(zigzag_coeffs)
 
             # --- Dequantization ---
@@ -625,8 +474,7 @@ def decode_image(encoded_channels):
             blocks_decoded_count += 1 # Increment block count
 
 
-        # --- Merge Blocks back into Channel Image ---
-        # Pass original h, w to block_merge so it can crop back correctly
+        # --- Merge Blocks back into Channel Image
         channel_img = block_merge(blocks, (h, w))
 
         # Add the reconstructed channel image (still in YCbCr range if color) to the list
@@ -634,18 +482,14 @@ def decode_image(encoded_channels):
 
         # After processing a channel, if not all expected blocks were decoded, issue warning
         if blocks_decoded_count < expected_num_blocks:
-             print(f"Warning: Decoded only {blocks_decoded_count}/{expected_num_blocks} blocks for {channel_type} channel. Bitstream might be incomplete or corrupted.")
+             logging.warning(f"Decoded only {blocks_decoded_count}/{expected_num_blocks} blocks for {channel_type} channel. Bitstream might be incomplete or corrupted.")
 
 
     # --- Stack Channels back together ---
     if len(reconstructed) == 1:
-        # Grayscale image: only one channel (Y)
-        # Ensure the final image is clipped to 0-255 and converted to uint8
         final_img = np.clip(reconstructed[0], 0, 255).astype(np.uint8)
     else:
-        # Color image: stack Y, Cb, Cr channels (assuming the order Y, Cb, Cr from encoding)
         img = np.stack(reconstructed, axis=-1)
-        # Convert from YCbCr to RGB. ycbcr_to_rgb already handles clipping and uint8 conversion.
         final_img = ycbcr_to_rgb(img)
 
     return final_img
