@@ -1,17 +1,6 @@
-"""
-encoder.py
-This file contains functions for JPEG compression, including Huffman encoding:
-- Convert image to YCbCr (for color)
-- Block splitting into 8x8
-- Apply DCT
-- Quantize DCT coefficients
-- Zig-zag scanning
-- Perform DC differential and AC RLE encoding
-- Perform Huffman encoding and write to bitstream
-"""
-
 import numpy as np
-from scipy.fftpack import dct, idct
+from scipy.fftpack import dct
+import logging
 
 # Standard JPEG Quantization Matrix for Luminance (Y)
 QUANTIZATION_MATRIX_LUMA = np.array([
@@ -21,10 +10,9 @@ QUANTIZATION_MATRIX_LUMA = np.array([
     [14, 17, 22, 29, 51, 87, 80, 62],
     [18, 22, 37, 56, 68, 109, 103, 77],
     [24, 35, 55, 64, 81, 104, 113, 92],
-    [49, 64, 78, 78, 103, 121, 120, 101], # Corrected one value (87 -> 78) as per common tables
+    [49, 64, 78, 78, 103, 121, 120, 101],  # corrected
     [72, 92, 95, 98, 112, 100, 103, 99]
 ])
-
 
 # Standard JPEG Quantization Matrix for Chrominance (Cb, Cr)
 QUANTIZATION_MATRIX_CHROMA = np.array([
@@ -38,239 +26,107 @@ QUANTIZATION_MATRIX_CHROMA = np.array([
     [99, 99, 99, 99, 99, 99, 99, 99]
 ])
 
+logging.basicConfig(level=logging.WARNING)
 
-# --- Helper functions for Size Category and Amplitude encoding/decoding ---
+# Helper functions for Size Category and Amplitude encoding/decoding
 
 def get_size_category(value):
-    """
-    Returns the bit size category for a value according to JPEG standard (Table K.3).
-    Size 0 for value 0. Size 1 for -1, 1, etc.
-    """
     if value == 0:
         return 0
     size = 0
     abs_value = abs(value)
-    while abs_value > (1 << size) -1:
+    while abs_value > (1 << size) - 1:
         size += 1
-        # Safety break/cap
-        if size > 11: # Max DC size is 11, max AC size is 10. Size 11 is possible for DC diff up to 1024.
-             print(f"Warning: Calculated unusually large size category {size} for value {value}. Capping at 11.")
-             size = 11
-             break
+        if size > 11:
+            logging.warning(f"Calculated unusually large size category {size} for value {value}, capping at 11.")
+            return 11
     return size
 
 
 def get_amplitude_bits(value, size):
-    """
-    Returns the bit representation (as an integer value) of the
-    coefficient amplitude based on its size category (Ref. JPEG standard, Table K.3, K.5).
-    """
-    if size == 0: # Should not happen for non-zero values with size > 0
+    if size == 0:
         return 0
     if value > 0:
-        # For positive values, the amplitude bits are just the binary representation
         return value
-    else: # value < 0
-        # For negative values, the amplitude bits are calculated as (2^size - 1) + value
-        # This gives the correct index within the range for the size.
+    else:
         return (1 << size) - 1 + value
 
-
-# --- Function to build Huffman tables from standard lengths and values ---
+# Build Huffman table
 
 def build_huffman_table(bits, values, table_type):
-    """
-    Builds a Huffman code table mapping symbol -> (code_length, code_value).
-    :param bits: List with counts of codes of length 1 to 16 (index 1-16).
-    :param values: List of symbols' byte representations (AC) or integer size categories (DC), ordered by code length.
-    :param table_type: String, either 'dc' or 'ac', to correctly interpret values.
-    :return: Dictionary mapping symbol (integer for DC, tuple (Run, Size) for AC) -> (code_length, code_value).
-    """
-    huffman_table = {}
+    # early check: sum of code counts must equal number of values
+    assert len(values) == sum(bits[1:]), \
+        f"{table_type} values length {len(values)} != sum(nrcodes) {sum(bits[1:])}"
+
+    table = {}
     code = 0
-    value_pos = 0
-
-    # The build process uses lengths 1 through 16 as per JPEG spec
-    for bit_length in range(1, 17):
-        # Get the number of codes for this specific length.
-        # The 'bits' list (nrcodes) is indexed 1 through 16.
-        if bit_length < len(bits): # Basic check, should be safe with standard lists
-             num_codes_of_length = bits[bit_length]
-        else:
-             # This indicates an issue with the nrcodes list if bit_length goes beyond its size
-             print(f"Warning: bit_length {bit_length} is out of bounds for bits list length {len(bits)}")
-             num_codes_of_length = 0
-
-        # For each code of this length, process the corresponding value
-        for i in range(num_codes_of_length):
-            # Check if the current position in the values list is within bounds
-            if value_pos >= len(values):
-                 # This is the error condition we are debugging
-                 print(f"DEBUG: Error condition met in build_huffman_table.")
-                 print(f"DEBUG: Table build failed when processing codes of length {bit_length}. Looking for code #{i+1} of this length.")
-                 print(f"DEBUG: Current value_pos: {value_pos}. The values list has {len(values)} elements.")
-                 # Sum the counts processed so far for more insight
-                 sum_nrcodes_so_far = sum(bits[l] for l in range(1, bit_length)) + i
-                 print(f"DEBUG: Sum of nrcodes processed up to this point: {sum_nrcodes_so_far}")
-                 # Re-raise the error with more context
-                 raise IndexError(f"list index out of range in build_huffman_table: value_pos {value_pos} >= len(values) {len(values)} at bit_length {bit_length}, code_index {i}")
-
-
-            raw_symbol_value = values[value_pos]
-
-            # Map the raw value to the internal symbol representation based on table type
+    pos = 0
+    for length in range(1, 17):
+        count = bits[length] if length < len(bits) else 0
+        for _ in range(count):
+            raw = values[pos]
             if table_type == 'dc':
-                # For DC tables, the raw value IS the symbol (size category 0-11)
-                symbol = raw_symbol_value
-                # Add a check to ensure it's a valid DC symbol value
-                if not (0 <= symbol <= 11):
-                     print(f"Warning: Unexpected raw DC symbol value {raw_symbol_value} encountered.")
-
-            elif table_type == 'ac':
-                 # Add debug print for AC raw values
-                 # print(f"DEBUG: Processing AC raw_symbol_value: {raw_symbol_value} (Type: {type(raw_symbol_value)})")
-                 # For AC tables, map the raw byte value to the symbol representation
-                 # Use explicit integer conversion and hex literals for robustness
-                 raw_val_int = int(raw_symbol_value)
-                 if raw_val_int == 0x00:
-                     symbol = (0, 0) # EOB symbol (Run=0, Size=0)
-                 elif raw_val_int == 0xF0:
-                      symbol = (15, 0) # ZRL symbol (Run=15, Size=0)
-                 # Check if the value is within the range for (Run, Size) symbols
-                 elif 0x01 <= raw_val_int <= 0xEF: # This range should include 0xF1 (241)
-                      # AC symbol (Run, Size). Run is bits 7-4, Size is bits 3-0.
-                      run = (raw_val_int >> 4) & 0x0F # Extract high 4 bits (Run, 0-15)
-                      size = raw_val_int & 0x0F      # Extract low 4 bits (Size, 0-15)
-                      symbol = (run, size) # Note: Size 0 for Run > 0 is technically possible but means 0 amplitude, usually skipped. ZRL is (15,0). EOB is (0,0).
-                 else:
-                      # This indicates an unexpected raw AC symbol value
-                      print(f"Warning: Unexpected raw AC symbol value {raw_symbol_value} ({raw_val_int}) encountered.")
-                      # Decide how to handle - maybe skip or raise error
-                      # For now, let's skip this value if it's not a standard AC symbol representation
-                      value_pos += 1 # Increment value_pos even if skipping
-                      continue # Skip this value and move to the next iteration
-
+                symbol = int(raw)
             else:
-                 raise ValueError(f"Unknown table_type: {table_type}")
-
-            # Store the mapping: symbol -> (code_length, code_value as integer)
-            # Ensure symbol is hashable (int or tuple)
-            if isinstance(symbol, (int, tuple)):
-                 huffman_table[symbol] = (bit_length, code)
-            else:
-                 print(f"Warning: Skipping unhashable symbol type {type(symbol)}: {symbol}")
-
-
+                raw_int = int(raw)
+                if raw_int == 0x00:
+                    symbol = (0, 0)
+                elif raw_int == 0xF0:
+                    symbol = (15, 0)
+                else:
+                    r = (raw_int >> 4) & 0x0F
+                    s = raw_int & 0x0F
+                    symbol = (r, s)
+            table[symbol] = (length, code)
             code += 1
-            value_pos += 1
-
-        # After processing all codes of the current bit_length, left shift the base code
-        # for the next bit length.
+            pos += 1
         code <<= 1
+    logging.debug(f"Built {table_type} table with {len(table)} symbols")
+    return table
 
-    # Add debug print after building the table
-    if table_type == 'ac':
-        print(f"DEBUG: Finished building {table_type} table. Total symbols added: {len(huffman_table)}")
-        # Check if (15, 1) is in the table keys
-        if (15, 1) in huffman_table:
-             print(f"DEBUG: Symbol (15, 1) FOUND in {table_type} table. Code: {huffman_table[(15, 1)]}")
-        else:
-             print(f"DEBUG: Symbol (15, 1) NOT FOUND in {table_type} table.")
-             # Optional: print all keys to inspect
-             # print(f"DEBUG: All keys in {table_type} table: {list(huffman_table.keys())}")
-
-
-    return huffman_table
-
-
-# --- Standard JPEG Huffman Table Data (as defined in the spec) ---
-# These lists define the structure and symbols for the standard tables.
-
-# DC Luminance: counts of codes per length, followed by symbols (0-11)
-# Total symbols for DC Luminance is sum(std_dc_luminance_nrcodes[1:12]) = 0+1+5+1+1+1+1+1+1+1+0 = 12
-# Length 1:0, L2:1, L3:5, L4:1, L5:1, L6:1, L7:1, L8:1, L9:1, L10:0, L11:0 ...
-std_dc_luminance_nrcodes = [0, 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0] # Index 0 unused, lengths 1-16
-std_dc_luminance_values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] # Total 12 symbols (Size Categories 0-11)
-
-# AC Luminance: counts of codes per length, followed by symbols (byte representation)
-# Total symbols for AC Luminance is sum(std_ac_luminance_nrcodes[1:17]) = 2+1+3+3+2+4+3+5+5+4+4+0+0+1+125 = 162
-std_ac_luminance_nrcodes = [0,0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,0x7d] # Last element 0x7d (125) is the count for length 16
-# THIS LIST MUST HAVE EXACTLY 162 ELEMENTS
+# Standard Huffman definitions
+std_dc_luminance_nrcodes = [0,0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0]
+std_dc_luminance_values = list(range(12))
+std_ac_luminance_nrcodes = [0,0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,0x7d]
 std_ac_luminance_values = [
-    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
-    0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
-    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08,
-    0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, # 0xF0 is ZRL
-    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16,
-    0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
-    0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-    0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
-    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
-    0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
-    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
-    0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
-    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
-    0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
-    0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
-    0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
-    0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4,
-    0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
-    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea,
-    0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
-    0xf9, 0xfa,
-    0x10, 0x20 # Total 162 elements
+    0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,0x51,0x61,0x07,
+    0x22,0x71,0x14,0x32,0x81,0x91,0xa1,0x08,0x23,0x42,0xb1,0xc1,0x15,0x52,0xd1,0xf0,
+    0x24,0x33,0x62,0x72,0x82,0x09,0x0a,0x16,0x17,0x18,0x19,0x1a,0x25,0x26,0x27,0x28,
+    0x29,0x2a,0x34,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,0x49,
+    0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,0x69,
+    0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x83,0x84,0x85,0x86,0x87,0x88,0x89,
+    0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,
+    0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,0xc4,0xc5,
+    0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,0xe1,0xe2,
+    0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,
+    0xf9,0xfa
+]
+std_dc_chrominance_nrcodes = [0,0,3,2,2,1,1,1,1,1,0,0,0,0,0,0,0]
+std_dc_chrominance_values = list(range(12))
+std_ac_chrominance_nrcodes = [0,0,2,1,2,4,4,3,4,7,5,4,4,0,1,2,0x77]
+std_ac_chrominance_values = [
+    0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,0x07,0x61,0x71,
+    0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xa1,0xb1,0xc1,0x09,0x23,0x33,0x52,0xf0,
+    0x15,0x62,0x72,0xd1,0x0a,0x16,0x24,0x34,0xe1,0x25,0xf1,0x17,0x18,0x19,0x1a,0x26,
+    0x27,0x28,0x29,0x2a,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,
+    0x49,0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,
+    0x69,0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x82,0x83,0x84,0x85,0x86,0x87,
+    0x88,0x89,0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,
+    0xa6,0xa7,0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,
+    0xc4,0xc5,0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,
+    0xe2,0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,
+    0xf9,0xfa
 ]
 
-# DC Chrominance: counts of codes per length, followed by symbols (0-11)
-# Total symbols for DC Chrominance is sum(std_dc_chrominance_nrcodes[1:12]) = 0+3+1+1+1+1+1+1+1+1+0 = 12
-# Length 1:0, L2:3, L3:1, L4:1, L5:1, L6:1, L7:1, L8:1, L9:1, L10:0, L11:0 ...
-std_dc_chrominance_nrcodes = [0, 0, 3, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0] # Index 0 unused, lengths 1-16
-std_dc_chrominance_values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] # Total 12 symbols (Size Categories 0-11)
-
-# AC Chrominance: counts of codes per length, followed by symbols (byte representation)
-# Total symbols for AC Chrominance is sum(std_ac_chrominance_nrcodes[1:17]) = 2+1+2+4+4+3+4+7+5+4+4+0+1+2+119 = 162
-std_ac_chrominance_nrcodes = [0,0,2,1,2,4,4,3,4,7,5,4,4,0,1,2,0x77] # Last element 0x77 (119) is count for length 16
-# THIS LIST MUST HAVE EXACTLY 162 ELEMENTS
-std_ac_chrominance_values = [
-    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21,
-    0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
-    0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
-    0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0, # ZRL
-    0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34,
-    0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
-    0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38,
-    0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
-    0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
-    0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
-    0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
-    0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
-    0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96,
-    0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5,
-    0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4,
-    0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
-    0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2,
-    0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
-    0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9,
-    0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
-    0xf9, 0xfa,
-    0x10, 0x20
-] # Total 162 elements
-
-
-# Add temporary print statements to verify list lengths *after* definition
-print(f"Length of std_dc_luminance_values: {len(std_dc_luminance_values)}")
-print(f"Length of std_ac_luminance_values: {len(std_ac_luminance_values)}")
-print(f"Length of std_dc_chrominance_values: {len(std_dc_chrominance_values)}")
-print(f"Length of std_ac_chrominance_values: {len(std_ac_chrominance_values)}")
-
-
-# === BUILD THE FINAL HUFFMAN TABLES (map symbol -> (length, code)) ===
-
-# Pass the table type ('dc' or 'ac') to the build function
+# Build tables
 HUFF_TABLE_LUMA_DC = build_huffman_table(std_dc_luminance_nrcodes, std_dc_luminance_values, 'dc')
 HUFF_TABLE_LUMA_AC = build_huffman_table(std_ac_luminance_nrcodes, std_ac_luminance_values, 'ac')
 HUFF_TABLE_CHROMA_DC = build_huffman_table(std_dc_chrominance_nrcodes, std_dc_chrominance_values, 'dc')
 HUFF_TABLE_CHROMA_AC = build_huffman_table(std_ac_chrominance_nrcodes, std_ac_chrominance_values, 'ac')
+
+print(f"Lengths: DC_Y={len(std_dc_luminance_values)}, AC_Y={len(std_ac_luminance_values)}, DC_C={len(std_dc_chrominance_values)}, AC_C={len(std_ac_chrominance_values)}")
+
+# … rest of encoder unchanged …
 
 
 # Helper to get the correct Huffman tables based on channel type
